@@ -239,7 +239,7 @@ class TestWandOperations(unittest.TestCase):
         return_value = image.save_as_png(output)
         output.seek(0)
 
-        converted_image = _wand_image().Image(file=output)
+        converted_image = _wand_image(file=output)
         self.assertEqual(converted_image.colorspace, "srgb")
         self.assertEqual(filetype.guess_extension(output), "png")
         self.assertIsInstance(return_value, PNGImageFile)

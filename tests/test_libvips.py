@@ -1,0 +1,556 @@
+import io
+import os
+import unittest
+from unittest import mock
+
+import filetype
+from PIL import Image as PILImage
+from wand import version as WAND_VERSION
+
+from willow.image import (
+    AvifImageFile,
+    BadImageOperationError,
+    GIFImageFile,
+    IcoImageFile,
+    JPEGImageFile,
+    PNGImageFile,
+    WebPImageFile,
+)
+from willow.optimizers import Cwebp, Gifsicle, Jpegoptim, Optipng, Pngquant
+from willow.plugins.libvips import LibVipsImage, _libvips_image, UnsupportedRotation
+from willow.registry import registry
+
+
+class TestLibVipsOperations(unittest.TestCase):
+    def setUp(self):
+        with open("tests/images/transparent.png", "rb") as f:
+            self.image = LibVipsImage.open(PNGImageFile(f))
+
+    def test_get_size(self):
+        width, height = self.image.get_size()
+        self.assertEqual(width, 200)
+        self.assertEqual(height, 150)
+
+    def test_get_frame_count(self):
+        frames = self.image.get_frame_count()
+        self.assertEqual(frames, 1)
+
+    def test_resize(self):
+        resized_image = self.image.resize((100, 75))
+        self.assertEqual(resized_image.get_size(), (100, 75))
+
+    def test_crop(self):
+        cropped_image = self.image.crop((10, 10, 100, 100))
+        self.assertEqual(cropped_image.get_size(), (90, 90))
+
+    def test_crop_out_of_bounds(self):
+        # crop rectangle should be clamped to the image boundaries
+        bottom_right_cropped_image = self.image.crop((150, 100, 250, 200))
+        self.assertEqual(bottom_right_cropped_image.get_size(), (50, 50))
+
+        top_left_cropped_image = self.image.crop((-50, -50, 50, 50))
+        self.assertEqual(top_left_cropped_image.get_size(), (50, 50))
+
+        # fail if the crop rectangle is entirely to the left of the image
+        with self.assertRaises(BadImageOperationError):
+            self.image.crop((-100, 50, -50, 100))
+        # right edge of crop rectangle is exclusive, so 0 is also invalid
+        with self.assertRaises(BadImageOperationError):
+            self.image.crop((-50, 50, 0, 100))
+
+        # fail if the crop rectangle is entirely above the image
+        with self.assertRaises(BadImageOperationError):
+            self.image.crop((50, -100, 100, -50))
+        # bottom edge of crop rectangle is exclusive, so 0 is also invalid
+        with self.assertRaises(BadImageOperationError):
+            self.image.crop((50, -50, 100, 0))
+
+        # fail if the crop rectangle is entirely to the right of the image
+        with self.assertRaises(BadImageOperationError):
+            self.image.crop((250, 50, 300, 100))
+        with self.assertRaises(BadImageOperationError):
+            self.image.crop((200, 50, 250, 100))
+
+        # fail if the crop rectangle is entirely below the image
+        with self.assertRaises(BadImageOperationError):
+            self.image.crop((50, 200, 100, 250))
+        with self.assertRaises(BadImageOperationError):
+            self.image.crop((50, 150, 100, 200))
+
+        # fail if left edge >= right edge
+        with self.assertRaises(BadImageOperationError):
+            self.image.crop((125, 25, 25, 125))
+        with self.assertRaises(BadImageOperationError):
+            self.image.crop((100, 25, 100, 125))
+
+        # fail if bottom edge >= top edge
+        with self.assertRaises(BadImageOperationError):
+            self.image.crop((25, 125, 125, 25))
+        with self.assertRaises(BadImageOperationError):
+            self.image.crop((25, 100, 125, 100))
+
+    def test_rotate(self):
+        rotated_image = self.image.rotate(90)
+        width, height = rotated_image.get_size()
+        self.assertEqual((width, height), (150, 200))
+
+    def test_rotate_without_multiple_of_90(self):
+        rotated_image = self.image.rotate(45)
+        width, height = rotated_image.get_size()
+        self.assertEqual((width, height), (247, 247))
+
+    def test_rotate_greater_than_360(self):
+        # 450 should end up the same as a 90 rotation
+        rotated_image = self.image.rotate(450)
+        width, height = rotated_image.get_size()
+        self.assertEqual((width, height), (150, 200))
+
+    def test_rotate_multiple_of_360(self):
+        rotated_image = self.image.rotate(720)
+        width, height = rotated_image.get_size()
+        self.assertEqual((width, height), (200, 150))
+
+    def test_set_background_color_rgb(self):
+        red_background_image = self.image.set_background_color_rgb((255, 0, 0))
+        self.assertFalse(red_background_image.has_alpha())
+        colour = red_background_image.image.getpoint(10, 10)
+        self.assertEqual(colour[0], 255.0)
+        self.assertEqual(colour[1], 0.0)
+        self.assertEqual(colour[2], 0.0)
+
+    def test_set_background_color_rgb_color_argument_check(self):
+        with self.assertRaises(TypeError) as e:
+            self.image.set_background_color_rgb("rgb(255, 0, 0)")
+
+        self.assertEqual(
+            str(e.exception), "the 'color' argument must be a 3-element tuple or list"
+        )
+
+    def test_save_as_jpeg(self):
+        # Remove alpha channel from image
+        image = self.image.set_background_color_rgb((255, 255, 255))
+
+        output = io.BytesIO()
+        return_value = image.save_as_jpeg(output)
+        output.seek(0)
+
+        self.assertEqual(filetype.guess_extension(output), "jpg")
+        self.assertIsInstance(return_value, JPEGImageFile)
+        self.assertEqual(return_value.f, output)
+
+    def test_save_as_jpeg_progressive(self):
+        # Remove alpha channel from image
+        image = self.image.set_background_color_rgb((255, 255, 255))
+
+        image = image.save_as_jpeg(io.BytesIO(), progressive=True)
+
+        self.assertTrue(PILImage.open(image.f).info["progressive"])
+
+    def test_save_as_jpeg_with_icc_profile(self):
+        images = ["colorchecker_sRGB.jpg", "colorchecker_ECI_RGB_v2.jpg"]
+        for img_name in images:
+            with open(f"tests/images/{img_name}", "rb") as f:
+                image = LibVipsImage.open(JPEGImageFile(f))
+
+            icc_profile = image.get_icc_profile()
+            self.assertIsNotNone(icc_profile)
+
+            buffer = io.BytesIO()
+            image.save_as_jpeg(buffer)
+            buffer.seek(0)
+
+            saved = LibVipsImage.open(JPEGImageFile(buffer))
+            saved_icc_profile = saved.get_icc_profile()
+            self.assertEqual(saved_icc_profile, icc_profile)
+
+    def test_save_as_jpeg_with_exif(self):
+        with open("tests/images/colorchecker_sRGB.jpg", "rb") as f:
+            image = LibVipsImage.open(JPEGImageFile(f))
+
+        exif_datetime = image.get_libvips_image().get("exif-ifd0-DateTime")
+        self.assertIsNotNone(exif_datetime)
+
+        buffer = io.BytesIO()
+        image.save_as_jpeg(buffer)
+        buffer.seek(0)
+
+        saved = LibVipsImage.open(JPEGImageFile(buffer))
+        saved_exif_datetime = saved.get_libvips_image().get("exif-ifd0-DateTime")
+        self.assertEqual(saved_exif_datetime, exif_datetime)
+
+    def test_save_as_png(self):
+        output = io.BytesIO()
+        return_value = self.image.save_as_png(output)
+        output.seek(0)
+
+        self.assertEqual(filetype.guess_extension(output), "png")
+        self.assertIsInstance(return_value, PNGImageFile)
+        self.assertEqual(return_value.f, output)
+
+    def test_save_as_png_with_exif(self):
+        for img_name in ["colorchecker_sRGB.jpg"]:
+            with open(f"tests/images/{img_name}", "rb") as f:
+                original = LibVipsImage.open(JPEGImageFile(f))
+
+            exif_datetime = original.get_libvips_image().get("exif-ifd0-DateTime")
+            self.assertIsNotNone(exif_datetime)
+
+            converted = original.save_as_png(io.BytesIO())
+
+            saved = LibVipsImage.open(converted)
+            saved_exif_datetime = saved.get_libvips_image().get("exif-ifd0-DateTime")
+            self.assertEqual(saved_exif_datetime, exif_datetime)
+
+    def test_save_as_gif(self):
+        output = io.BytesIO()
+        return_value = self.image.save_as_gif(output)
+        output.seek(0)
+
+        self.assertEqual(filetype.guess_extension(output), "gif")
+        self.assertIsInstance(return_value, GIFImageFile)
+        self.assertEqual(return_value.f, output)
+
+    def test_save_mode_cmyk_as_png(self):
+        with open("tests/images/cmyk.jpg", "rb") as f:
+            image = LibVipsImage.open(JPEGImageFile(f))
+
+        output = io.BytesIO()
+        return_value = image.save_as_png(output)
+        output.seek(0)
+
+        self.assertEqual(filetype.guess_extension(output), "png")
+        self.assertIsInstance(return_value, PNGImageFile)
+        self.assertEqual(return_value.f, output)
+
+    def test_has_alpha(self):
+        has_alpha = self.image.has_alpha()
+        self.assertTrue(has_alpha)
+
+    def test_has_animation(self):
+        has_animation = self.image.has_animation()
+        self.assertFalse(has_animation)
+
+    def test_transparent_gif(self):
+        with open("tests/images/transparent.gif", "rb") as f:
+            image = LibVipsImage.open(GIFImageFile(f))
+
+        self.assertTrue(image.has_alpha())
+        self.assertFalse(image.has_animation())
+
+        # Check that the alpha of pixel 1,1 is 0
+        self.assertEqual(image.image.getpoint(1, 1)[3], 0)
+
+    def test_resize_transparent_gif(self):
+        with open("tests/images/transparent.gif", "rb") as f:
+            image = LibVipsImage.open(GIFImageFile(f))
+
+        resized_image = image.resize((100, 75))
+
+        self.assertTrue(resized_image.has_alpha())
+        self.assertFalse(resized_image.has_animation())
+
+        # Check that the alpha of pixel 1,1 is 0
+        self.assertAlmostEqual(resized_image.image.getpoint(1, 1)[3], 0, places=6)
+
+    def test_animated_gif(self):
+        with open("tests/images/newtons_cradle.gif", "rb") as f:
+            image = LibVipsImage.open(GIFImageFile(f))
+
+        self.assertTrue(image.has_animation())
+
+        self.assertEqual(image.get_frame_count(), 34)
+
+    def test_resize_animated_gif(self):
+        with open("tests/images/newtons_cradle.gif", "rb") as f:
+            image = LibVipsImage.open(GIFImageFile(f))
+
+        resized_image = image.resize((100, 75))
+
+        self.assertTrue(resized_image.has_animation())
+
+    def test_get_libvips_image(self):
+        libvips_image = self.image.get_libvips_image()
+
+        self.assertIsInstance(libvips_image, _libvips_image())
+
+    def test_open_avif(self):
+        with open("tests/images/tree.avif", "rb") as f:
+            image = LibVipsImage.open(AvifImageFile(f))
+
+        self.assertFalse(image.has_alpha())
+        self.assertFalse(image.has_animation())
+
+    def test_save_as_avif(self):
+        output = io.BytesIO()
+        return_value = self.image.save_as_avif(output)
+        output.seek(0)
+
+        self.assertEqual(filetype.guess_extension(output), "avif")
+        self.assertIsInstance(return_value, AvifImageFile)
+        self.assertEqual(return_value.f, output)
+
+    def test_save_avif_quality(self):
+        high_quality = self.image.save_as_avif(io.BytesIO(), quality=90)
+        low_quality = self.image.save_as_avif(io.BytesIO(), quality=30)
+        self.assertTrue(low_quality.f.tell() < high_quality.f.tell())
+
+    def test_save_avif_lossless(self):
+        original_image = self.image.image
+
+        lossless_file = self.image.save_as_avif(io.BytesIO(), lossless=True)
+        lossless_image = LibVipsImage.open(lossless_file).image
+
+        magick_version = WAND_VERSION.MAGICK_VERSION_INFO
+        if magick_version >= (7, 1):
+            # we allow a small margin of error to account for OS/library version differences
+            # Ref: https://github.com/bigcat88/pillow_heif/blob/3798f0df6b12c19dfa8fd76dd6259b329bf88029/tests/write_test.py#L415-L422
+            _, result_metric = original_image.compare(
+                lossless_image, metric="root_mean_square"
+            )
+            self.assertTrue(result_metric <= 0.02)
+        else:
+            identical = True
+            for x in range(original_image.width):
+                for y in range(original_image.height):
+                    original_pixel = original_image.getpoint(x, y)
+                    # don't compare fully transparent pixels
+                    if original_pixel[3] == 0.0:
+                        continue
+                    if original_pixel != lossless_image.getpoint(x, y):
+                        break
+            self.assertTrue(identical)
+
+    def test_save_as_webp(self):
+        output = io.BytesIO()
+        return_value = self.image.save_as_webp(output)
+        output.seek(0)
+
+        self.assertEqual(filetype.guess_extension(output), "webp")
+        self.assertIsInstance(return_value, WebPImageFile)
+        self.assertEqual(return_value.f, output)
+
+    def test_open_webp(self):
+        with open("tests/images/tree.webp", "rb") as f:
+            image = LibVipsImage.open(WebPImageFile(f))
+
+        self.assertFalse(image.has_alpha())
+        self.assertFalse(image.has_animation())
+
+    def test_open_webp_w_alpha(self):
+        with open("tests/images/tux_w_alpha.webp", "rb") as f:
+            image = LibVipsImage.open(WebPImageFile(f))
+
+        self.assertTrue(image.has_alpha())
+        self.assertFalse(image.has_animation())
+
+    def test_save_webp_quality(self):
+        high_quality = self.image.save_as_webp(io.BytesIO(), quality=90)
+        low_quality = self.image.save_as_webp(io.BytesIO(), quality=30)
+        self.assertTrue(low_quality.f.tell() < high_quality.f.tell())
+
+    def test_save_webp_lossless(self):
+        original_image = self.image.image
+
+        new_f = io.BytesIO()
+        lossless_file = self.image.save_as_webp(new_f, lossless=True)
+        lossless_image = LibVipsImage.open(lossless_file).image
+
+        magick_version = WAND_VERSION.MAGICK_VERSION_INFO
+        if magick_version >= (7, 1):
+            _, result_metric = original_image.compare(
+                lossless_image, metric="root_mean_square"
+            )
+            self.assertTrue(result_metric <= 0.001)
+        else:
+            identical = True
+            for x in range(original_image.width):
+                for y in range(original_image.height):
+                    original_pixel = original_image.getpoint(x, y)
+                    # don't compare fully transparent pixels
+                    if original_pixel[3] == 0.0:
+                        continue
+                    if original_pixel != lossless_image.getpoint(x, y):
+                        break
+            self.assertTrue(identical)
+
+    def test_save_as_webp_with_icc_profile(self):
+        images = ["colorchecker_sRGB.jpg", "colorchecker_ECI_RGB_v2.jpg"]
+        for img_name in images:
+            with open(f"tests/images/{img_name}", "rb") as f:
+                image = LibVipsImage.open(JPEGImageFile(f))
+
+            icc_profile = image.get_icc_profile()
+            self.assertIsNotNone(icc_profile)
+
+            buffer = io.BytesIO()
+            image.save_as_webp(buffer)
+            buffer.seek(0)
+
+            saved = LibVipsImage.open(WebPImageFile(buffer))
+            saved_icc_profile = saved.get_icc_profile()
+            self.assertEqual(saved_icc_profile, icc_profile)
+
+    def test_save_as_ico(self):
+        output = io.BytesIO()
+        return_value = self.image.save_as_ico(output)
+        output.seek(0)
+
+        self.assertEqual(filetype.guess_extension(output), "ico")
+        self.assertIsInstance(return_value, IcoImageFile)
+        self.assertEqual(return_value.f, output)
+
+
+class TestLibVipsImageWithOptimizers(unittest.TestCase):
+    def setUp(self):
+        with mock.patch.dict(os.environ, {"WILLOW_OPTIMIZERS": "true"}):
+            registry.register_optimizer(Gifsicle)
+            registry.register_optimizer(Jpegoptim)
+            registry.register_optimizer(Optipng)
+            registry.register_optimizer(Pngquant)
+
+    def tearDown(self):
+        # reset the registry as we get the global state
+        registry._registered_optimizers = []
+
+    @unittest.skipIf(not Jpegoptim.check_library(), "jpegoptim not installed")
+    def test_save_as_jpeg(self):
+        with open("tests/images/flower.jpg", "rb") as f:
+            original_size = os.fstat(f.fileno()).st_size
+            image = LibVipsImage.open(JPEGImageFile(f))
+
+        return_value = image.save_as_jpeg(io.BytesIO())
+        self.assertTrue(original_size > return_value.f.seek(0, io.SEEK_END))
+
+        with mock.patch(
+            "willow.plugins.libvips.LibVipsImage.optimize"
+        ) as mock_optimize:
+            image.save_as_jpeg(io.BytesIO(), apply_optimizers=False)
+            mock_optimize.assert_not_called()
+
+    @unittest.skipIf(
+        not (Pngquant.check_library() and Optipng.check_library()),
+        "optipng or pngquant not installed",
+    )
+    def test_save_as_png(self):
+        with open("tests/images/transparent.png", "rb") as f:
+            original_size = os.fstat(f.fileno()).st_size
+            image = LibVipsImage.open(PNGImageFile(f))
+
+        return_value = image.save_as_png(io.BytesIO())
+        self.assertTrue(original_size > return_value.f.seek(0, io.SEEK_END))
+
+        with mock.patch(
+            "willow.plugins.libvips.LibVipsImage.optimize"
+        ) as mock_optimize:
+            image.save_as_png(io.BytesIO(), apply_optimizers=False)
+            mock_optimize.assert_not_called()
+
+    @unittest.skipIf(not Gifsicle.check_library(), "gifsicle not installed")
+    def test_save_as_gif(self):
+        with open("tests/images/transparent.gif", "rb") as f:
+            original_size = f.tell()
+            image = LibVipsImage.open(GIFImageFile(f))
+
+        return_value = image.save_as_gif(io.BytesIO())
+        self.assertTrue(original_size < return_value.f.tell())
+
+        with mock.patch(
+            "willow.plugins.libvips.LibVipsImage.optimize"
+        ) as mock_optimize:
+            image.save_as_gif(io.BytesIO(), apply_optimizers=False)
+            mock_optimize.assert_not_called()
+
+    def test_save_as_webp(self):
+        with open("tests/images/tree.webp", "rb") as f:
+            original_size = os.fstat(f.fileno()).st_size
+            image = LibVipsImage.open(WebPImageFile(f))
+
+        return_value = image.save_as_gif(io.BytesIO())
+        self.assertTrue(original_size < return_value.f.tell())
+
+        with mock.patch("willow.plugins.pillow.PillowImage.optimize") as mock_optimize:
+            image.save_as_webp(io.BytesIO(), apply_optimizers=False)
+            mock_optimize.assert_not_called()
+
+
+class TestLibVipsImageOrientation(unittest.TestCase):
+    def assert_orientation_landscape_image_is_correct(self, image):
+        # Check that the image is the correct size (and not rotated)
+        self.assertEqual(image.get_size(), (600, 450))
+
+        # Check that the red flower is in the bottom left
+        # The JPEGs have compressed slightly differently so the colours won't be spot on
+        colour = image.image[282][155]
+        self.assertAlmostEqual(colour.red * 255, 217, delta=15)
+        self.assertAlmostEqual(colour.green * 255, 38, delta=15)
+        self.assertAlmostEqual(colour.blue * 255, 46, delta=15)
+
+        # Check that the water is at the bottom
+        colour = image.image[434][377]
+        self.assertAlmostEqual(colour.red * 255, 85, delta=15)
+        self.assertAlmostEqual(colour.green * 255, 93, delta=15)
+        self.assertAlmostEqual(colour.blue * 255, 65, delta=15)
+
+    def test_jpeg_with_orientation_1(self):
+        with open("tests/images/orientation/landscape_1.jpg", "rb") as f:
+            image = LibVipsImage.open(JPEGImageFile(f))
+
+        image = image.auto_orient()
+
+        self.assert_orientation_landscape_image_is_correct(image)
+
+    def test_jpeg_with_orientation_2(self):
+        with open("tests/images/orientation/landscape_2.jpg", "rb") as f:
+            image = LibVipsImage.open(JPEGImageFile(f))
+
+        image = image.auto_orient()
+
+        self.assert_orientation_landscape_image_is_correct(image)
+
+    def test_jpeg_with_orientation_3(self):
+        with open("tests/images/orientation/landscape_3.jpg", "rb") as f:
+            image = LibVipsImage.open(JPEGImageFile(f))
+
+        image = image.auto_orient()
+
+        self.assert_orientation_landscape_image_is_correct(image)
+
+    def test_jpeg_with_orientation_4(self):
+        with open("tests/images/orientation/landscape_4.jpg", "rb") as f:
+            image = LibVipsImage.open(JPEGImageFile(f))
+
+        image = image.auto_orient()
+
+        self.assert_orientation_landscape_image_is_correct(image)
+
+    def test_jpeg_with_orientation_5(self):
+        with open("tests/images/orientation/landscape_5.jpg", "rb") as f:
+            image = LibVipsImage.open(JPEGImageFile(f))
+
+        image = image.auto_orient()
+
+        self.assert_orientation_landscape_image_is_correct(image)
+
+    def test_jpeg_with_orientation_6(self):
+        with open("tests/images/orientation/landscape_6.jpg", "rb") as f:
+            image = LibVipsImage.open(JPEGImageFile(f))
+
+        image = image.auto_orient()
+
+        self.assert_orientation_landscape_image_is_correct(image)
+
+    def test_jpeg_with_orientation_7(self):
+        with open("tests/images/orientation/landscape_7.jpg", "rb") as f:
+            image = LibVipsImage.open(JPEGImageFile(f))
+
+        image = image.auto_orient()
+
+        self.assert_orientation_landscape_image_is_correct(image)
+
+    def test_jpeg_with_orientation_8(self):
+        with open("tests/images/orientation/landscape_8.jpg", "rb") as f:
+            image = LibVipsImage.open(JPEGImageFile(f))
+
+        image = image.auto_orient()
+
+        self.assert_orientation_landscape_image_is_correct(image)
